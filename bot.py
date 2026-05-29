@@ -10,6 +10,18 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
+from db import (
+    init_db,
+    load_active_schedules,
+    create_schedule_record,
+    update_schedule_message_id,
+    save_availability,
+    delete_availability_day,
+    delete_availability_user,
+    deactivate_schedule,
+    prune_old_schedules,
+)
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -22,12 +34,15 @@ REQUIRE_LEADER_ROLE = False  # 실제 적용 시 True 권장
 
 ANYTIME_VALUE = "ANYTIME"
 
+MIN_RAID_MEMBER_COUNT = 6
+MAX_VISIBLE_MEMBER_ROWS = 8
+MAX_STORED_SCHEDULE_COUNT = 10
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 메모리 저장소
+# DB에서 로드되는 메모리 캐시
 schedules = {}
-
 
 def get_week_dates(base_date: Optional[datetime] = None):
     """
@@ -282,55 +297,54 @@ def format_intersection_time(minutes: int):
 
 def compute_intersections(schedule_id: int):
     """
-    현재 입력한 공대원 전체 기준으로 날짜별 교집합 계산
+    날짜별 진행 가능 시간 계산
+
+    기준:
+    - 해당 날짜에 가능 시간을 입력한 공대원이 MIN_RAID_MEMBER_COUNT명 이상이면 진행 가능
+    - 진행 가능 시간은 그 인원들의 가능 시작 시간 중 가장 늦은 시간
+    - ANYTIME은 00:00으로 계산
     """
     schedule = schedules[schedule_id]
-    active_users = get_active_users(schedule_id)
-
     results = {}
 
     for day_key in schedule["days"].keys():
-        if not active_users:
+        available_members = []
+
+        for _, user_data in schedule["availability"].items():
+            selected = user_data["selected"]
+
+            if day_key not in selected:
+                continue
+
+            available_members.append({
+                "name": user_data["name"],
+                "time": selected[day_key],
+                "minutes": time_value_to_minutes(selected[day_key]),
+            })
+
+        available_count = len(available_members)
+
+        if available_count < MIN_RAID_MEMBER_COUNT:
             results[day_key] = {
                 "possible": False,
-                "reason": "no_users",
+                "reason": "not_enough_members",
                 "start_minutes": None,
-                "display_text": "참여 인원 없음",
-                "missing_names": [],
+                "display_text": f"{available_count}/{MIN_RAID_MEMBER_COUNT}명",
+                "available_count": available_count,
+                "available_names": [member["name"] for member in available_members],
             }
             continue
 
-        missing_names = []
-        candidate_minutes = []
+        intersection_start = max(member["minutes"] for member in available_members)
 
-        for _, user_data in active_users.items():
-            selected = user_data["selected"]
-            user_name = user_data["name"]
-
-            if day_key not in selected:
-                missing_names.append(user_name)
-                continue
-
-            candidate_minutes.append(time_value_to_minutes(selected[day_key]))
-
-        if missing_names:
-            results[day_key] = {
-                "possible": False,
-                "reason": "missing_users",
-                "start_minutes": None,
-                "display_text": "일부 공대원 미입력",
-                "missing_names": missing_names,
-            }
-        else:
-            intersection_start = max(candidate_minutes) if candidate_minutes else 0
-
-            results[day_key] = {
-                "possible": True,
-                "reason": None,
-                "start_minutes": intersection_start,
-                "display_text": format_intersection_time(intersection_start),
-                "missing_names": [],
-            }
+        results[day_key] = {
+            "possible": True,
+            "reason": None,
+            "start_minutes": intersection_start,
+            "display_text": format_intersection_time(intersection_start),
+            "available_count": available_count,
+            "available_names": [member["name"] for member in available_members],
+        }
 
     return results
 
@@ -380,7 +394,6 @@ def load_font(size: int, bold: bool = False):
 
     return ImageFont.load_default()
 
-
 def make_calendar_file(schedule_id: int):
     schedule = schedules[schedule_id]
     week_dates = schedule["week_dates"]
@@ -388,14 +401,29 @@ def make_calendar_file(schedule_id: int):
     intersections = compute_intersections(schedule_id)
     possible_days_summary = build_possible_days_summary(schedule_id)
 
+    possible_lines = possible_days_summary.split("\n")
+
     # 이미지 크기
     width = 2100
-    header_height = 140
-    title_height = 80
-    cell_height = 500
-    summary_box_height = 250
-    footer_height = 40
-    height = header_height + title_height + cell_height + 40 + summary_box_height + footer_height
+
+    # 상단 안내 박스 제거
+    top_area_height = 120
+
+    # 공대원 입력 현황 최대 8명 기준으로 높이 확보
+    cell_height = 560
+
+    # 레이드 진행 가능일 박스 높이 자동 계산
+    summary_line_height = 34
+    summary_box_base_height = 130
+    summary_box_height = max(
+        250,
+        summary_box_base_height + len(possible_lines) * summary_line_height
+    )
+
+    footer_height = 50
+    calendar_top = top_area_height
+    summary_top = calendar_top + cell_height + 28
+    height = summary_top + summary_box_height + footer_height
 
     # 색상
     bg = (247, 249, 252)
@@ -408,10 +436,10 @@ def make_calendar_file(schedule_id: int):
     gray_text = (110, 120, 130)
     line_color = (225, 230, 236)
 
-    intersection_green_bg = (232, 247, 236)
-    intersection_green_border = (82, 173, 107)
-    intersection_orange_bg = (255, 244, 229)
-    intersection_orange_border = (235, 162, 78)
+    possible_bg = (232, 247, 236)
+    possible_border = (82, 173, 107)
+    disabled_bg = (255, 244, 229)
+    disabled_border = (235, 162, 78)
 
     img = Image.new("RGB", (width, height), bg)
     draw = ImageDraw.Draw(img)
@@ -423,39 +451,31 @@ def make_calendar_file(schedule_id: int):
     day_font = load_font(24, bold=True)
     day_sub_font = load_font(20, bold=False)
     count_font = load_font(20, bold=True)
-    item_font = load_font(18, bold=False)
+    item_font = load_font(17, bold=False)
     small_font = load_font(17, bold=False)
     box_title_font = load_font(22, bold=True)
     box_value_font = load_font(19, bold=True)
 
     # 상단 타이틀
-    draw.text((40, 28), f"{schedule['title']} 주간 스케줄", font=title_font, fill=title_color)
     draw.text(
-        (40, 75),
-        f"대상 주간: {schedule['week_start_label']} ~ {schedule['week_end_label']}   |   참여 인원: {get_participant_count(schedule_id)}명",
-        font=sub_font,
-        fill=sub_color
+        (40, 24),
+        f"{schedule['title']} 주간 스케줄",
+        font=title_font,
+        fill=title_color
     )
 
-    # 안내문 박스
-    info_top = 110
-    info_bottom = info_top + 82
-    draw.rounded_rectangle((32, info_top, width - 32, info_bottom), radius=16, fill=white, outline=border, width=2)
     draw.text(
-        (52, info_top + 16),
-        "날짜별로 '몇 시 이후 가능' 정보와 공대원 교집합 결과가 함께 표시됩니다.",
+        (40, 72),
+        (
+            f"대상 주간: {schedule['week_start_label']} ~ {schedule['week_end_label']}"
+            f"   |   참여 인원: {get_participant_count(schedule_id)}명"
+            f"   |   진행 가능 기준: {MIN_RAID_MEMBER_COUNT}명 이상"
+        ),
         font=sub_font,
         fill=sub_color
-    )
-    draw.text(
-        (52, info_top + 44),
-        "입력 예시: 21 / 오후 9시 / 오후 9시 30분 / 공란=아무때나 가능",
-        font=small_font,
-        fill=gray_text
     )
 
     # 주간 달력 영역
-    calendar_top = header_height + title_height - 10
     left_margin = 30
     right_margin = 30
     gap = 14
@@ -473,44 +493,69 @@ def make_calendar_file(schedule_id: int):
         entries = summary.get(day_key, [])
         intersection = intersections[day_key]
 
-        # 카드 배경
-        draw.rounded_rectangle((x1, y1, x2, y2), radius=18, fill=white, outline=border, width=2)
+        # 카드 외곽선
+        card_outline = possible_border if intersection["possible"] else border
+
+        draw.rounded_rectangle(
+            (x1, y1, x2, y2),
+            radius=18,
+            fill=white,
+            outline=card_outline,
+            width=3 if intersection["possible"] else 2
+        )
 
         # 카드 헤더
         header_h = 78
-        draw.rounded_rectangle((x1, y1, x2, y1 + header_h), radius=18, fill=header_bg, outline=header_bg)
+        draw.rounded_rectangle(
+            (x1, y1, x2, y1 + header_h),
+            radius=18,
+            fill=header_bg,
+            outline=header_bg
+        )
         draw.rectangle((x1, y1 + 18, x2, y1 + header_h), fill=header_bg)
 
-        draw.text((x1 + 18, y1 + 14), date_obj.strftime("%m/%d"), font=day_font, fill=title_color)
-        draw.text((x1 + 18, y1 + 44), f"{weekday}요일", font=day_sub_font, fill=sub_color)
+        draw.text(
+            (x1 + 18, y1 + 14),
+            date_obj.strftime("%m/%d"),
+            font=day_font,
+            fill=title_color
+        )
+        draw.text(
+            (x1 + 18, y1 + 44),
+            f"{weekday}요일",
+            font=day_sub_font,
+            fill=sub_color
+        )
 
         count_text = f"{len(entries)}명 입력" if entries else "선택 없음"
         count_fill = green if entries else gray_text
 
         count_bbox = draw.textbbox((0, 0), count_text, font=count_font)
         count_w = count_bbox[2] - count_bbox[0]
-        draw.text((x2 - count_w - 18, y1 + 26), count_text, font=count_font, fill=count_fill)
 
-        # 교집합 박스
+        draw.text(
+            (x2 - count_w - 18, y1 + 26),
+            count_text,
+            font=count_font,
+            fill=count_fill
+        )
+
+        # 진행 가능 시간 박스
         inter_box_top = y1 + header_h + 14
-        inter_box_bottom = inter_box_top + 78
+        inter_box_bottom = inter_box_top + 86
 
         if intersection["possible"]:
-            inter_fill = intersection_green_bg
-            inter_outline = intersection_green_border
-            inter_title = "교집합 가능"
+            inter_fill = possible_bg
+            inter_outline = possible_border
+            inter_title = "진행 가능 시간"
             inter_value = intersection["display_text"]
+            inter_sub = f"{intersection['available_count']}명 가능"
         else:
-            inter_fill = intersection_orange_bg
-            inter_outline = intersection_orange_border
-            inter_title = "교집합 없음"
-
-            if intersection["reason"] == "no_users":
-                inter_value = "참여 인원 없음"
-            elif intersection["reason"] == "missing_users":
-                inter_value = f"미입력 {len(intersection['missing_names'])}명"
-            else:
-                inter_value = "조건 불충족"
+            inter_fill = disabled_bg
+            inter_outline = disabled_border
+            inter_title = "진행 불가"
+            inter_value = f"{intersection['available_count']}/{MIN_RAID_MEMBER_COUNT}명"
+            inter_sub = f"{MIN_RAID_MEMBER_COUNT}명 이상 필요"
 
         draw.rounded_rectangle(
             (x1 + 14, inter_box_top, x2 - 14, inter_box_bottom),
@@ -520,26 +565,55 @@ def make_calendar_file(schedule_id: int):
             width=2
         )
 
-        draw.text((x1 + 28, inter_box_top + 12), inter_title, font=box_title_font, fill=title_color)
-        draw.text((x1 + 28, inter_box_top + 42), inter_value, font=box_value_font, fill=title_color)
+        draw.text(
+            (x1 + 28, inter_box_top + 10),
+            inter_title,
+            font=box_title_font,
+            fill=title_color
+        )
 
-        # 공대원 입력 리스트
+        draw.text(
+            (x1 + 28, inter_box_top + 38),
+            inter_value,
+            font=box_value_font,
+            fill=title_color
+        )
+
+        draw.text(
+            (x1 + 28, inter_box_top + 62),
+            inter_sub,
+            font=small_font,
+            fill=sub_color
+        )
+
+        # 공대원 입력 현황
         content_top = inter_box_bottom + 18
         content_left = x1 + 16
         content_right = x2 - 16
 
-        draw.text((content_left, content_top), "공대원 입력 현황", font=sub_bold_font, fill=title_color)
+        draw.text(
+            (content_left, content_top),
+            "공대원 입력 현황",
+            font=sub_bold_font,
+            fill=title_color
+        )
 
         list_top = content_top + 34
 
         if not entries:
-            draw.text((content_left, list_top + 6), "아직 입력한 공대원이 없습니다.", font=item_font, fill=gray_text)
+            draw.text(
+                (content_left, list_top + 6),
+                "아직 입력한 공대원이 없습니다.",
+                font=item_font,
+                fill=gray_text
+            )
         else:
-            row_h = 34
-            max_visible = 7
+            row_h = 30
+            row_gap = 6
+            max_visible = MAX_VISIBLE_MEMBER_ROWS
 
             for item_idx, item in enumerate(entries[:max_visible]):
-                row_top = list_top + item_idx * (row_h + 8)
+                row_top = list_top + item_idx * (row_h + row_gap)
                 row_bottom = row_top + row_h
 
                 draw.rounded_rectangle(
@@ -551,14 +625,23 @@ def make_calendar_file(schedule_id: int):
                 )
 
                 line_text = f"{format_time_korean(item['time'])} - {item['name']}"
-                draw.text((content_left + 10, row_top + 7), line_text, font=item_font, fill=title_color)
+                draw.text(
+                    (content_left + 10, row_top + 6),
+                    line_text,
+                    font=item_font,
+                    fill=title_color
+                )
 
             if len(entries) > max_visible:
                 more_text = f"... 외 {len(entries) - max_visible}명"
-                draw.text((content_left, y2 - 34), more_text, font=small_font, fill=gray_text)
+                draw.text(
+                    (content_left, y2 - 30),
+                    more_text,
+                    font=small_font,
+                    fill=gray_text
+                )
 
     # 하단 레이드 진행 가능일 박스
-    summary_top = calendar_top + cell_height + 26
     summary_bottom = summary_top + summary_box_height
 
     draw.rounded_rectangle(
@@ -569,26 +652,47 @@ def make_calendar_file(schedule_id: int):
         width=2
     )
 
-    draw.text((54, summary_top + 18), "레이드 진행 가능일", font=title_font, fill=title_color)
+    draw.text(
+        (54, summary_top + 18),
+        "레이드 진행 가능일",
+        font=title_font,
+        fill=title_color
+    )
+
     draw.text(
         (54, summary_top + 64),
-        "현재 시간을 입력한 공대원 전체가 공통으로 가능한 날짜와 시작 가능 시간입니다.",
+        f"{MIN_RAID_MEMBER_COUNT}명 이상 공통으로 가능한 날짜와 시작 가능 시간입니다.",
         font=sub_font,
         fill=sub_color
     )
 
     text_y = summary_top + 108
 
-    if "공통으로 가능한 날짜가 없습니다" in possible_days_summary or "아직 시간을 입력한 공대원이 없어" in possible_days_summary:
-        draw.text((58, text_y), possible_days_summary, font=sub_bold_font, fill=gray_text)
+    if f"{MIN_RAID_MEMBER_COUNT}명 이상 공통으로 가능한 날짜가 없습니다" in possible_days_summary:
+        draw.text(
+            (58, text_y),
+            possible_days_summary,
+            font=sub_bold_font,
+            fill=gray_text
+        )
     else:
-        for line in possible_days_summary.split("\n"):
-            draw.text((58, text_y), line, font=sub_bold_font, fill=title_color)
-            text_y += 32
+        for line in possible_lines:
+            draw.text(
+                (58, text_y),
+                line,
+                font=sub_bold_font,
+                fill=title_color
+            )
+            text_y += summary_line_height
 
-    # 하단 작은 설명
+    # 하단 설명
     footer_text = "※ 이미지 갱신 시 최신 참석 가능 시간이 반영됩니다."
-    draw.text((36, height - 28), footer_text, font=small_font, fill=gray_text)
+    draw.text(
+        (36, height - 34),
+        footer_text,
+        font=small_font,
+        fill=gray_text
+    )
 
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
@@ -609,7 +713,7 @@ def build_schedule_embed(schedule_id: int):
             "입력 예시: `21`, `21:30`, `오전 9시`, `오후 9시`, `오후 9시 30분`\n"
             "공란 제출: `아무때나 가능`\n"
             "삭제 예시: `삭제` / `없음`\n\n"
-            "※ 교집합은 **현재 시간을 입력한 공대원 전체 기준**으로 계산됩니다."
+            f"※ 레이드 진행 가능일은 **{MIN_RAID_MEMBER_COUNT}명 이상** 가능한 날짜만 표시됩니다."
         ),
         color=discord.Color.blue(),
     )
@@ -637,6 +741,68 @@ def build_schedule_embed(schedule_id: int):
 
     return embed
 
+def build_deleted_schedule_embed(schedule):
+    embed = discord.Embed(
+        title=f"🗑️ {schedule['title']} 스케줄 삭제됨",
+        description=(
+            "이 스케줄은 공대장에 의해 삭제되었습니다.\n"
+            "더 이상 주간 일정 입력을 받을 수 없습니다."
+        ),
+        color=discord.Color.dark_gray(),
+    )
+
+    embed.add_field(
+        name="생성자",
+        value=schedule["creator_name"],
+        inline=True,
+    )
+
+    embed.add_field(
+        name="대상 주간",
+        value=f"{schedule['week_start_label']} ~ {schedule['week_end_label']}",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Schedule ID",
+        value=str(schedule["id"]),
+        inline=True,
+    )
+
+    return embed
+
+async def deactivate_schedule_by_id(schedule_id: int):
+    if schedule_id not in schedules:
+        return False, "활성 스케줄을 찾을 수 없습니다."
+
+    schedule = schedules[schedule_id]
+
+    # DB에서 비활성화
+    deactivate_schedule(schedule_id)
+
+    # 기존 디스코드 스케줄 메시지 수정
+    try:
+        channel = bot.get_channel(schedule["channel_id"])
+
+        if channel is None:
+            channel = await bot.fetch_channel(schedule["channel_id"])
+
+        if schedule.get("message_id"):
+            message = await channel.fetch_message(schedule["message_id"])
+
+            await message.edit(
+                embed=build_deleted_schedule_embed(schedule),
+                attachments=[],
+                view=None,
+            )
+
+    except Exception as e:
+        print(f"Failed to update deleted schedule message: {e}")
+
+    # 메모리 캐시에서 제거
+    schedules.pop(schedule_id, None)
+
+    return True, schedule["title"]
 
 async def update_schedule_message(schedule_id: int):
     schedule = schedules[schedule_id]
@@ -677,10 +843,15 @@ class AvailableAfterModal(discord.ui.Modal):
 
         super().__init__(title=f"{day_label} 가능 시간 입력")
 
+        if current_value == ANYTIME_VALUE:
+            display_default = ""
+        else:
+            display_default = current_value
+
         self.time_input = discord.ui.TextInput(
             label="몇 시 이후 가능한가요?",
-            placeholder="공란=아무때나 가능 / 예: 오후 9시 / 삭제하려면 '삭제'",
-            default=current_value,
+            placeholder="공란=아무때나 가능 / 예: 오후 9시 / 삭제",
+            default=display_default,
             required=False,
             max_length=20,
         )
@@ -718,8 +889,10 @@ class AvailableAfterModal(discord.ui.Modal):
             if self.day_key == "__ALL__":
                 for day_key in schedule["days"].keys():
                     schedule["availability"][user_id]["selected"].pop(day_key, None)
+                    delete_availability_day(self.schedule_id, user_id, day_key)
             else:
                 schedule["availability"][user_id]["selected"].pop(self.day_key, None)
+                delete_availability_day(self.schedule_id, user_id, self.day_key)
 
             rebuild_summary(self.schedule_id)
             await update_schedule_message(self.schedule_id)
@@ -736,8 +909,24 @@ class AvailableAfterModal(discord.ui.Modal):
             if self.day_key == "__ALL__":
                 for day_key in schedule["days"].keys():
                     schedule["availability"][user_id]["selected"][day_key] = saved_time
+
+                    save_availability(
+                        self.schedule_id,
+                        user_id,
+                        user_name,
+                        day_key,
+                        saved_time,
+                    )
             else:
                 schedule["availability"][user_id]["selected"][self.day_key] = saved_time
+
+                save_availability(
+                    self.schedule_id,
+                    user_id,
+                    user_name,
+                    self.day_key,
+                    saved_time,
+                )
 
             rebuild_summary(self.schedule_id)
             await update_schedule_message(self.schedule_id)
@@ -807,6 +996,8 @@ class ResetMyScheduleButton(discord.ui.Button):
 
         if user_id in schedule["availability"]:
             schedule["availability"][user_id]["selected"] = {}
+            delete_availability_user(self.schedule_id, user_id)
+
             rebuild_summary(self.schedule_id)
             await update_schedule_message(self.schedule_id)
 
@@ -833,22 +1024,17 @@ class DaySelectView(discord.ui.View):
         self.add_item(AllDaysButton(schedule_id))
         self.add_item(ResetMyScheduleButton(schedule_id))
 
-class ScheduleMainView(discord.ui.View):
+class OpenWeekInputButton(discord.ui.Button):
     def __init__(self, schedule_id: int):
-        super().__init__(timeout=None)
+        super().__init__(
+            label="주간 일정 입력하기",
+            style=discord.ButtonStyle.success,
+            emoji="🗓️",
+            custom_id=f"open_week_input:{schedule_id}",
+        )
         self.schedule_id = schedule_id
 
-    @discord.ui.button(
-        label="주간 일정 입력하기",
-        style=discord.ButtonStyle.success,
-        emoji="🗓️",
-        custom_id="open_week_input",
-    )
-    async def open_calendar(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
+    async def callback(self, interaction: discord.Interaction):
         if self.schedule_id not in schedules:
             await interaction.response.send_message(
                 "이미 만료되었거나 찾을 수 없는 스케줄입니다.",
@@ -864,12 +1050,95 @@ class ScheduleMainView(discord.ui.View):
             ephemeral=True,
         )
 
+class ScheduleDeleteButton(discord.ui.Button):
+    def __init__(self, schedule_id: int, schedule_title: str):
+        super().__init__(
+            label=f"삭제: {schedule_title}",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"delete_schedule:{schedule_id}",
+        )
+        self.schedule_id = schedule_id
+        self.schedule_title = schedule_title
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "서버 안에서만 사용할 수 있는 기능입니다.",
+                ephemeral=True,
+            )
+            return
+
+        if not is_raid_leader(interaction.user):
+            await interaction.response.send_message(
+                "공대장만 스케줄을 삭제할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        if self.schedule_id not in schedules:
+            await interaction.response.send_message(
+                "이미 삭제되었거나 찾을 수 없는 스케줄입니다.",
+                ephemeral=True,
+            )
+            return
+
+        success, result = await deactivate_schedule_by_id(self.schedule_id)
+
+        if not success:
+            await interaction.response.send_message(
+                f"삭제 실패: {result}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"🗑️ Schedule ID `{self.schedule_id}` - `{result}` 스케줄을 삭제했습니다.",
+            ephemeral=True,
+        )
+
+
+class ScheduleListView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+        # Discord 한 View에는 버튼을 최대 25개까지 넣을 수 있음
+        for schedule_id, schedule in sorted(schedules.items()):
+            self.add_item(
+                ScheduleDeleteButton(
+                    schedule_id=schedule_id,
+                    schedule_title=schedule["title"],
+                )
+            )
+
+class ScheduleMainView(discord.ui.View):
+    def __init__(self, schedule_id: int):
+        super().__init__(timeout=None)
+        self.schedule_id = schedule_id
+        self.add_item(OpenWeekInputButton(schedule_id))
+
 
 @bot.event
 async def on_ready():
+    global schedules
+
     print(f"Logged in as {bot.user}")
 
     try:
+        init_db()
+
+        deleted_schedule_ids = prune_old_schedules(MAX_STORED_SCHEDULE_COUNT)
+
+        if deleted_schedule_ids:
+            print(f"Pruned old schedule(s) from SQLite on startup: {deleted_schedule_ids}")
+
+        schedules = load_active_schedules()
+
+        for schedule_id in schedules.keys():
+            rebuild_summary(schedule_id)
+            bot.add_view(ScheduleMainView(schedule_id))
+
+        print(f"Loaded {len(schedules)} active schedule(s) from SQLite")
+
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             bot.tree.copy_global_to(guild=guild)
@@ -878,8 +1147,9 @@ async def on_ready():
         else:
             synced = await bot.tree.sync()
             print(f"Synced {len(synced)} command(s)")
+
     except Exception as e:
-        print(f"Failed to sync commands: {e}")
+        print(f"Failed to initialize bot: {e}")
 
 
 @bot.tree.command(
@@ -907,8 +1177,6 @@ async def create_schedule(
         )
         return
 
-    schedule_id = len(schedules) + 1
-
     week_dates = get_week_dates()
     week_start = week_dates[0]
     week_end = week_dates[-1]
@@ -918,6 +1186,27 @@ async def create_schedule(
         day_key = date_obj.strftime("%Y-%m-%d")
         days[day_key] = format_day_label(date_obj)
 
+    temp_schedule = {
+        "title": 제목,
+        "creator_id": interaction.user.id,
+        "creator_name": interaction.user.display_name,
+        "guild_id": interaction.guild_id,
+        "channel_id": interaction.channel_id,
+        "message_id": None,
+        "week_start": week_start.strftime("%Y-%m-%d"),
+        "week_end": week_end.strftime("%Y-%m-%d"),
+    }
+
+    schedule_id = create_schedule_record(temp_schedule)
+
+    deleted_schedule_ids = prune_old_schedules(MAX_STORED_SCHEDULE_COUNT)
+
+    for deleted_schedule_id in deleted_schedule_ids:
+        schedules.pop(deleted_schedule_id, None)
+
+    if deleted_schedule_ids:
+        print(f"Pruned old schedule(s) from SQLite: {deleted_schedule_ids}")
+
     schedules[schedule_id] = {
         "id": schedule_id,
         "title": 제목,
@@ -926,6 +1215,8 @@ async def create_schedule(
         "guild_id": interaction.guild_id,
         "channel_id": interaction.channel_id,
         "message_id": None,
+        "week_start": week_start.strftime("%Y-%m-%d"),
+        "week_end": week_end.strftime("%Y-%m-%d"),
         "week_dates": week_dates,
         "week_start_label": format_day_label(week_start),
         "week_end_label": format_day_label(week_end),
@@ -949,6 +1240,122 @@ async def create_schedule(
     message = await interaction.original_response()
     schedules[schedule_id]["message_id"] = message.id
 
+    update_schedule_message_id(schedule_id, message.id)
+
+    bot.add_view(ScheduleMainView(schedule_id))
+
+@bot.tree.command(
+    name="스케줄목록",
+    description="현재 활성화된 레이드 스케줄 목록을 확인합니다.",
+)
+async def list_schedules(interaction: discord.Interaction):
+    if not schedules:
+        await interaction.response.send_message(
+            "현재 활성화된 스케줄이 없습니다.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="📋 활성 스케줄 목록",
+        description=(
+            "현재 활성화된 스케줄입니다.\n"
+            "공대장은 아래 삭제 버튼으로 스케줄을 삭제할 수 있습니다."
+        ),
+        color=discord.Color.blue(),
+    )
+
+    for schedule_id, schedule in sorted(schedules.items()):
+        participant_count = get_participant_count(schedule_id)
+        possible_days_summary = build_possible_days_summary(schedule_id)
+
+        if len(possible_days_summary) > 250:
+            possible_days_summary = possible_days_summary[:250] + "\n..."
+
+        value = (
+            f"**Schedule ID:** `{schedule_id}`\n"
+            f"**대상 주간:** {schedule['week_start_label']} ~ {schedule['week_end_label']}\n"
+            f"**참여 인원:** {participant_count}명\n"
+            f"**레이드 진행 가능일:**\n{possible_days_summary}"
+        )
+
+        embed.add_field(
+            name=f"📅 {schedule['title']}",
+            value=value,
+            inline=False,
+        )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=ScheduleListView(),
+        ephemeral=True,
+    )
+
+# @bot.tree.command(
+#     name="스케줄삭제",
+#     description="지정한 레이드 스케줄을 삭제합니다.",
+# )
+# @app_commands.describe(
+#     스케줄번호="삭제할 스케줄 번호입니다. /스케줄목록에서 확인할 수 있습니다."
+# )
+# async def delete_schedule(
+#     interaction: discord.Interaction,
+#     스케줄번호: int,
+# ):
+#     if not isinstance(interaction.user, discord.Member):
+#         await interaction.response.send_message(
+#             "서버 안에서만 사용할 수 있는 명령어입니다.",
+#             ephemeral=True,
+#         )
+#         return
+
+#     if not is_raid_leader(interaction.user):
+#         await interaction.response.send_message(
+#             "공대장만 스케줄을 삭제할 수 있습니다.",
+#             ephemeral=True,
+#         )
+#         return
+
+#     schedule_id = 스케줄번호
+
+#     if schedule_id not in schedules:
+#         await interaction.response.send_message(
+#             f"Schedule ID `{schedule_id}` 에 해당하는 활성 스케줄을 찾을 수 없습니다.",
+#             ephemeral=True,
+#         )
+#         return
+
+#     schedule = schedules[schedule_id]
+
+#     # DB에서 비활성화
+#     deactivate_schedule(schedule_id)
+
+#     # 기존 디스코드 메시지 버튼 제거 및 삭제 표시
+#     try:
+#         channel = bot.get_channel(schedule["channel_id"])
+
+#         if channel is None:
+#             channel = await bot.fetch_channel(schedule["channel_id"])
+
+#         if schedule.get("message_id"):
+#             message = await channel.fetch_message(schedule["message_id"])
+
+#             await message.edit(
+#                 embed=build_deleted_schedule_embed(schedule),
+#                 attachments=[],
+#                 view=None,
+#             )
+
+#     except Exception as e:
+#         print(f"Failed to update deleted schedule message: {e}")
+
+#     # 메모리 캐시에서 제거
+#     schedules.pop(schedule_id, None)
+
+#     await interaction.response.send_message(
+#         f"🗑️ Schedule ID `{schedule_id}` - `{schedule['title']}` 스케줄을 삭제했습니다.",
+#         ephemeral=True,
+#     )
 
 if TOKEN is None:
     raise RuntimeError("DISCORD_TOKEN이 .env에 설정되어 있지 않습니다.")
