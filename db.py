@@ -48,6 +48,63 @@ def init_db():
         """
     )
 
+    schedule_columns = cur.execute("PRAGMA table_info(schedules)").fetchall()
+    schedule_column_names = [column["name"] for column in schedule_columns]
+
+    if "is_confirmed" not in schedule_column_names:
+        cur.execute(
+            """
+            ALTER TABLE schedules
+            ADD COLUMN is_confirmed INTEGER NOT NULL DEFAULT 0
+            """
+        )
+
+    if "confirmed_day_key" not in schedule_column_names:
+        cur.execute(
+            """
+            ALTER TABLE schedules
+            ADD COLUMN confirmed_day_key TEXT
+            """
+        )
+
+    if "confirmed_time_value" not in schedule_column_names:
+        cur.execute(
+            """
+            ALTER TABLE schedules
+            ADD COLUMN confirmed_time_value TEXT
+            """
+        )
+
+    if "confirmed_label" not in schedule_column_names:
+        cur.execute(
+            """
+            ALTER TABLE schedules
+            ADD COLUMN confirmed_label TEXT
+            """
+        )
+
+    if "confirmed_at" not in schedule_column_names:
+        cur.execute(
+            """
+            ALTER TABLE schedules
+            ADD COLUMN confirmed_at TEXT
+            """
+        )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS confirmed_schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_id INTEGER NOT NULL,
+            day_key TEXT NOT NULL,
+            time_value TEXT NOT NULL,
+            label TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(schedule_id) REFERENCES schedules(id)
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -227,6 +284,14 @@ def load_active_schedules():
         """
     ).fetchall()
 
+    confirmed_rows = cur.execute(
+        """
+        SELECT *
+        FROM confirmed_schedules
+        ORDER BY schedule_id ASC, id ASC
+        """
+    ).fetchall()
+
     conn.close()
 
     schedules = {}
@@ -258,13 +323,25 @@ def load_active_schedules():
             "days": days,
             "availability": {},
             "summary": {},
+            "is_confirmed": row["is_confirmed"],
+            "confirmed_schedules": [],
         }
 
-    for row in availability_rows:
+    for row in confirmed_rows:
         schedule_id = row["schedule_id"]
 
         if schedule_id not in schedules:
             continue
+
+        schedules[schedule_id]["confirmed_schedules"].append(
+            {
+                "id": row["id"],
+                "day_key": row["day_key"],
+                "time_value": row["time_value"],
+                "label": row["label"],
+                "created_at": row["created_at"],
+            }
+        )
 
         user_id = str(row["user_id"])
 
@@ -321,6 +398,14 @@ def prune_old_schedules(max_count=10):
 
         cur.execute(
             """
+            DELETE FROM confirmed_schedules
+            WHERE schedule_id = ?
+            """,
+            (schedule_id,),
+        )
+
+        cur.execute(
+            """
             DELETE FROM schedules
             WHERE id = ?
             """,
@@ -331,3 +416,86 @@ def prune_old_schedules(max_count=10):
     conn.close()
 
     return delete_ids
+
+def clear_confirmed_schedules(schedule_id):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        DELETE FROM confirmed_schedules
+        WHERE schedule_id = ?
+        """,
+        (schedule_id,),
+    )
+
+    cur.execute(
+        """
+        UPDATE schedules
+        SET is_confirmed = 0,
+            confirmed_day_key = NULL,
+            confirmed_time_value = NULL,
+            confirmed_label = NULL,
+            confirmed_at = NULL
+        WHERE id = ?
+        """,
+        (schedule_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_confirmed_schedules(schedule_id, confirmed_items):
+    """
+    confirmed_items 예시:
+    [
+        {
+            "day_key": "2026-05-29",
+            "time_value": "21:00",
+            "label": "05/29 (금) - 오후 09시 00분 이후"
+        }
+    ]
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        DELETE FROM confirmed_schedules
+        WHERE schedule_id = ?
+        """,
+        (schedule_id,),
+    )
+
+    for item in confirmed_items:
+        cur.execute(
+            """
+            INSERT INTO confirmed_schedules (
+                schedule_id,
+                day_key,
+                time_value,
+                label
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                schedule_id,
+                item["day_key"],
+                item["time_value"],
+                item["label"],
+            ),
+        )
+
+    cur.execute(
+        """
+        UPDATE schedules
+        SET is_confirmed = 1,
+            confirmed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (schedule_id,),
+    )
+
+    conn.commit()
+    conn.close()

@@ -20,6 +20,8 @@ from db import (
     delete_availability_user,
     deactivate_schedule,
     prune_old_schedules,
+    save_confirmed_schedules,
+    clear_confirmed_schedules,
 )
 
 load_dotenv()
@@ -370,6 +372,50 @@ def build_possible_days_summary(schedule_id: int):
 
     return "\n".join(lines)
 
+def is_schedule_confirmed(schedule_id: int):
+    schedule = schedules[schedule_id]
+    return bool(schedule.get("is_confirmed")) and bool(schedule.get("confirmed_schedules"))
+
+
+def build_confirmed_schedule_summary(schedule_id: int):
+    schedule = schedules[schedule_id]
+    confirmed_items = schedule.get("confirmed_schedules", [])
+
+    if not confirmed_items:
+        return "아직 확정된 일정이 없습니다."
+
+    lines = []
+    for item in confirmed_items:
+        lines.append(f"• {item['label']}")
+
+    return "\n".join(lines)
+
+
+def build_schedule_status_summary(schedule_id: int):
+    if is_schedule_confirmed(schedule_id):
+        return build_confirmed_schedule_summary(schedule_id)
+
+    return build_possible_days_summary(schedule_id)
+
+
+async def confirm_schedule_by_items(schedule_id: int, confirmed_items: list[dict]):
+    if schedule_id not in schedules:
+        return False, "활성 스케줄을 찾을 수 없습니다."
+
+    if not confirmed_items:
+        return False, "확정할 일정이 없습니다."
+
+    schedule = schedules[schedule_id]
+
+    schedule["is_confirmed"] = 1
+    schedule["confirmed_schedules"] = confirmed_items
+
+    save_confirmed_schedules(schedule_id, confirmed_items)
+
+    await update_schedule_message(schedule_id)
+
+    return True, build_confirmed_schedule_summary(schedule_id)
+
 def load_font(size: int, bold: bool = False):
     """
     Linux/WSL에서 한글 표시 가능한 폰트를 우선 사용
@@ -399,7 +445,7 @@ def make_calendar_file(schedule_id: int):
     week_dates = schedule["week_dates"]
     summary = schedule["summary"]
     intersections = compute_intersections(schedule_id)
-    possible_days_summary = build_possible_days_summary(schedule_id)
+    possible_days_summary = build_schedule_status_summary(schedule_id)
 
     possible_lines = possible_days_summary.split("\n")
 
@@ -544,12 +590,37 @@ def make_calendar_file(schedule_id: int):
         inter_box_top = y1 + header_h + 14
         inter_box_bottom = inter_box_top + 86
 
-        if intersection["possible"]:
+        ##confirmed_day_key = schedule.get("confirmed_day_key")
+        
+        confirmed_items_for_day = [
+            item
+            for item in schedule.get("confirmed_schedules", [])
+            if item["day_key"] == day_key
+        ]
+
+        if is_schedule_confirmed(schedule_id) and confirmed_items_for_day:
+            confirmed_item = confirmed_items_for_day[0]
+
+            inter_fill = possible_bg
+            inter_outline = possible_border
+            inter_title = "확정 일정"
+
+            if confirmed_item["time_value"] == ANYTIME_VALUE:
+                inter_value = "아무때나 가능"
+            elif confirmed_item["time_value"] == "직접 입력":
+                inter_value = "직접 입력"
+            else:
+                inter_value = format_time_korean(confirmed_item["time_value"])
+
+            inter_sub = "레이드 진행 예정일"
+
+        elif intersection["possible"]:
             inter_fill = possible_bg
             inter_outline = possible_border
             inter_title = "진행 가능 시간"
             inter_value = intersection["display_text"]
             inter_sub = f"{intersection['available_count']}명 가능"
+
         else:
             inter_fill = disabled_bg
             inter_outline = disabled_border
@@ -652,20 +723,28 @@ def make_calendar_file(schedule_id: int):
         width=2
     )
 
+    summary_title = "레이드 진행 예정일" if is_schedule_confirmed(schedule_id) else "레이드 진행 가능일"
+
     draw.text(
         (54, summary_top + 18),
-        "레이드 진행 가능일",
+        summary_title,
         font=title_font,
         fill=title_color
     )
 
+    summary_description = (
+        "확정된 레이드 진행 예정일입니다."
+        if is_schedule_confirmed(schedule_id)
+        else f"{MIN_RAID_MEMBER_COUNT}명 이상 공통으로 가능한 날짜와 시작 가능 시간입니다."
+    )
+
     draw.text(
         (54, summary_top + 64),
-        f"{MIN_RAID_MEMBER_COUNT}명 이상 공통으로 가능한 날짜와 시작 가능 시간입니다.",
+        summary_description,
         font=sub_font,
         fill=sub_color
     )
-
+    
     text_y = summary_top + 108
 
     if f"{MIN_RAID_MEMBER_COUNT}명 이상 공통으로 가능한 날짜가 없습니다" in possible_days_summary:
@@ -703,19 +782,27 @@ def make_calendar_file(schedule_id: int):
 
 def build_schedule_embed(schedule_id: int):
     schedule = schedules[schedule_id]
-    possible_days_summary = build_possible_days_summary(schedule_id)
+    schedule_status_summary = build_schedule_status_summary(schedule_id)
 
-    embed = discord.Embed(
-        title=f"📅 {schedule['title']} 스케줄",
-        description=(
+    if is_schedule_confirmed(schedule_id):
+        description = (
+            "이 스케줄은 **확정된 스케줄**입니다.\n"
+            "더 이상 주간 일정 입력을 받지 않습니다."
+        )
+    else:
+        description = (
             "아래 버튼을 눌러 이번 주 참석 가능한 **날짜**를 고른 뒤,\n"
             "**그 날 몇 시 이후 가능한지** 입력하세요.\n\n"
             "입력 예시: `21`, `21:30`, `오전 9시`, `오후 9시`, `오후 9시 30분`\n"
             "공란 제출: `아무때나 가능`\n"
             "삭제 예시: `삭제` / `없음`\n\n"
             f"※ 레이드 진행 가능일은 **{MIN_RAID_MEMBER_COUNT}명 이상** 가능한 날짜만 표시됩니다."
-        ),
-        color=discord.Color.blue(),
+        )
+
+    embed = discord.Embed(
+        title=f"📅 {schedule['title']} 스케줄",
+        description=description,
+        color=discord.Color.green() if is_schedule_confirmed(schedule_id) else discord.Color.blue(),
     )
 
     embed.add_field(name="생성자", value=schedule["creator_name"], inline=True)
@@ -731,8 +818,8 @@ def build_schedule_embed(schedule_id: int):
     )
 
     embed.add_field(
-        name="레이드 진행 가능일",
-        value=possible_days_summary,
+        name="레이드 진행 예정일" if is_schedule_confirmed(schedule_id) else "레이드 진행 가능일",
+        value=schedule_status_summary,
         inline=False,
     )
 
@@ -820,10 +907,12 @@ async def update_schedule_message(schedule_id: int):
         embed = build_schedule_embed(schedule_id)
         calendar_file = make_calendar_file(schedule_id)
 
+        view = None if is_schedule_confirmed(schedule_id) else ScheduleMainView(schedule_id)
+
         await message.edit(
-            embed=embed,
+            embed=build_schedule_embed(schedule_id),
             attachments=[calendar_file],
-            view=ScheduleMainView(schedule_id),
+            view=view,
         )
     except Exception as e:
         print(f"Failed to update schedule message: {e}")
@@ -1050,6 +1139,239 @@ class OpenWeekInputButton(discord.ui.Button):
             ephemeral=True,
         )
 
+class ConfirmPossibleDaySelect(discord.ui.Select):
+    def __init__(self, schedule_id: int):
+        self.schedule_id = schedule_id
+        schedule = schedules[schedule_id]
+        intersections = compute_intersections(schedule_id)
+
+        options = []
+
+        for day_key, day_label in schedule["days"].items():
+            info = intersections[day_key]
+
+            if not info["possible"]:
+                continue
+
+            options.append(
+                discord.SelectOption(
+                    label=day_label,
+                    value=day_key,
+                    description=info["display_text"],
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="진행 가능일 없음",
+                    value="__NONE__",
+                    description="직접 입력 버튼을 사용하세요.",
+                )
+            )
+
+        max_values = 1 if options[0].value == "__NONE__" else len(options)
+
+        super().__init__(
+            placeholder="레이드 진행 가능일을 하나 이상 선택하세요.",
+            min_values=1,
+            max_values=max_values,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_day_keys = self.values
+
+        if "__NONE__" in selected_day_keys:
+            await interaction.response.send_message(
+                "현재 선택 가능한 레이드 진행 가능일이 없습니다. 직접 입력을 사용하세요.",
+                ephemeral=True,
+            )
+            return
+
+        schedule = schedules[self.schedule_id]
+        intersections = compute_intersections(self.schedule_id)
+
+        confirmed_items = []
+
+        for selected_day_key in selected_day_keys:
+            info = intersections[selected_day_key]
+
+            if not info["possible"]:
+                continue
+
+            start_minutes = info["start_minutes"]
+
+            if start_minutes == 0:
+                confirmed_time_value = ANYTIME_VALUE
+            else:
+                confirmed_time_value = minutes_to_time_value(start_minutes)
+
+            confirmed_label = (
+                f"{schedule['days'][selected_day_key]} - "
+                f"{format_intersection_time(start_minutes)}"
+            )
+
+            confirmed_items.append(
+                {
+                    "day_key": selected_day_key,
+                    "time_value": confirmed_time_value,
+                    "label": confirmed_label,
+                }
+            )
+
+        success, result = await confirm_schedule_by_items(
+            schedule_id=self.schedule_id,
+            confirmed_items=confirmed_items,
+        )
+
+        if not success:
+            await interaction.response.send_message(
+                f"확정 실패: {result}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ `{schedule['title']}` 스케줄을 확정했습니다.\n{result}",
+            ephemeral=True,
+        )
+
+
+class ManualConfirmModal(discord.ui.Modal):
+    def __init__(self, schedule_id: int):
+        self.schedule_id = schedule_id
+
+        schedule = schedules[schedule_id]
+
+        super().__init__(title=f"{schedule['title']} 직접 확정")
+
+        self.confirm_text = discord.ui.TextInput(
+            label="확정할 일정을 직접 입력하세요.",
+            placeholder="예:\n06/01 (월) 오후 9시\n06/03 (수) 오후 10시",
+            required=True,
+            max_length=500,
+            style=discord.TextStyle.paragraph,
+        )
+
+        self.add_item(self.confirm_text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_text = str(self.confirm_text.value or "").strip()
+
+        if not raw_text:
+            await interaction.response.send_message(
+                "확정할 일정을 입력해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        lines = [
+            line.strip()
+            for line in raw_text.splitlines()
+            if line.strip()
+        ]
+
+        confirmed_items = []
+
+        for idx, line in enumerate(lines):
+            confirmed_items.append(
+                {
+                    "day_key": f"__MANUAL__{idx + 1}",
+                    "time_value": "직접 입력",
+                    "label": line,
+                }
+            )
+
+        success, result = await confirm_schedule_by_items(
+            schedule_id=self.schedule_id,
+            confirmed_items=confirmed_items,
+        )
+
+        if not success:
+            await interaction.response.send_message(
+                f"확정 실패: {result}",
+                ephemeral=True,
+            )
+            return
+
+        schedule = schedules[self.schedule_id]
+
+        await interaction.response.send_message(
+            f"✅ `{schedule['title']}` 스케줄을 직접 입력한 일정으로 확정했습니다.\n{result}",
+            ephemeral=True,
+        )
+
+
+class ManualConfirmButton(discord.ui.Button):
+    def __init__(self, schedule_id: int):
+        super().__init__(
+            label="직접 입력으로 확정",
+            style=discord.ButtonStyle.secondary,
+        )
+        self.schedule_id = schedule_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            ManualConfirmModal(self.schedule_id)
+        )
+
+
+class ConfirmScheduleView(discord.ui.View):
+    def __init__(self, schedule_id: int):
+        super().__init__(timeout=300)
+        self.schedule_id = schedule_id
+        self.add_item(ConfirmPossibleDaySelect(schedule_id))
+        self.add_item(ManualConfirmButton(schedule_id))
+
+
+class ScheduleConfirmButton(discord.ui.Button):
+    def __init__(self, schedule_id: int, schedule_title: str):
+        super().__init__(
+            label=f"확정: {schedule_title}",
+            style=discord.ButtonStyle.success,
+            custom_id=f"confirm_schedule:{schedule_id}",
+        )
+        self.schedule_id = schedule_id
+        self.schedule_title = schedule_title
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "서버 안에서만 사용할 수 있는 기능입니다.",
+                ephemeral=True,
+            )
+            return
+
+        if not is_raid_leader(interaction.user):
+            await interaction.response.send_message(
+                "공대장만 스케줄을 확정할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        if self.schedule_id not in schedules:
+            await interaction.response.send_message(
+                "이미 삭제되었거나 찾을 수 없는 스케줄입니다.",
+                ephemeral=True,
+            )
+            return
+
+        if is_schedule_confirmed(self.schedule_id):
+            await interaction.response.send_message(
+                "이미 확정된 스케줄입니다.",
+                ephemeral=True,
+            )
+            return
+
+        schedule = schedules[self.schedule_id]
+
+        await interaction.response.send_message(
+            f"✅ `{schedule['title']}` 스케줄을 확정할 방법을 선택하세요.",
+            view=ConfirmScheduleView(self.schedule_id),
+            ephemeral=True,
+        )
+
 class ScheduleDeleteButton(discord.ui.Button):
     def __init__(self, schedule_id: int, schedule_title: str):
         super().__init__(
@@ -1101,8 +1423,15 @@ class ScheduleListView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
 
-        # Discord 한 View에는 버튼을 최대 25개까지 넣을 수 있음
         for schedule_id, schedule in sorted(schedules.items()):
+            if not is_schedule_confirmed(schedule_id):
+                self.add_item(
+                    ScheduleConfirmButton(
+                        schedule_id=schedule_id,
+                        schedule_title=schedule["title"],
+                    )
+                )
+
             self.add_item(
                 ScheduleDeleteButton(
                     schedule_id=schedule_id,
@@ -1135,7 +1464,9 @@ async def on_ready():
 
         for schedule_id in schedules.keys():
             rebuild_summary(schedule_id)
-            bot.add_view(ScheduleMainView(schedule_id))
+
+            if not is_schedule_confirmed(schedule_id):
+                bot.add_view(ScheduleMainView(schedule_id))
 
         print(f"Loaded {len(schedules)} active schedule(s) from SQLite")
 
@@ -1223,6 +1554,8 @@ async def create_schedule(
         "days": days,
         "availability": {},
         "summary": {},
+        "is_confirmed": 0,
+        "confirmed_schedules": [],
     }
 
     rebuild_summary(schedule_id)
@@ -1267,16 +1600,19 @@ async def list_schedules(interaction: discord.Interaction):
 
     for schedule_id, schedule in sorted(schedules.items()):
         participant_count = get_participant_count(schedule_id)
-        possible_days_summary = build_possible_days_summary(schedule_id)
+        schedule_status_summary = build_schedule_status_summary(schedule_id)
 
-        if len(possible_days_summary) > 250:
-            possible_days_summary = possible_days_summary[:250] + "\n..."
+        if len(schedule_status_summary) > 250:
+            schedule_status_summary = schedule_status_summary[:250] + "\n..."
+
+        status_title = "레이드 진행 예정일" if is_schedule_confirmed(schedule_id) else "레이드 진행 가능일"
 
         value = (
             f"**Schedule ID:** `{schedule_id}`\n"
             f"**대상 주간:** {schedule['week_start_label']} ~ {schedule['week_end_label']}\n"
             f"**참여 인원:** {participant_count}명\n"
-            f"**레이드 진행 가능일:**\n{possible_days_summary}"
+            f"**상태:** {'확정됨' if is_schedule_confirmed(schedule_id) else '입력 중'}\n"
+            f"**{status_title}:**\n{schedule_status_summary}"
         )
 
         embed.add_field(
