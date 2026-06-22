@@ -1,7 +1,7 @@
 import io
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
@@ -46,6 +46,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # DB에서 로드되는 메모리 캐시
 schedules = {}
 
+KST = timezone(timedelta(hours=9))
+MAX_MANUAL_SCHEDULE_DAYS = 14
+
 def get_week_dates(base_date: Optional[datetime] = None):
     """
     수요일 시작 주간 생성
@@ -53,7 +56,7 @@ def get_week_dates(base_date: Optional[datetime] = None):
     수요일 ~ 다음 주 화요일
     """
     if base_date is None:
-        base_date = datetime.now()
+        base_date = datetime.now(KST)
 
     # Python weekday(): 월=0, 화=1, 수=2, 목=3 ...
     WEDNESDAY = 2
@@ -62,6 +65,24 @@ def get_week_dates(base_date: Optional[datetime] = None):
     week_start = base_date - timedelta(days=days_since_wednesday)
 
     return [week_start + timedelta(days=i) for i in range(7)]
+
+
+def get_manual_dates(start_text: str, end_text: str):
+    """YYYY-MM-DD 형식의 시작일과 종료일로 날짜 목록을 만든다."""
+    try:
+        start_date = datetime.strptime(start_text, "%Y-%m-%d")
+        end_date = datetime.strptime(end_text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("날짜는 `YYYY-MM-DD` 형식으로 입력해 주세요.") from exc
+
+    if end_date < start_date:
+        raise ValueError("종료일은 시작일과 같거나 이후여야 합니다.")
+
+    day_count = (end_date - start_date).days + 1
+    if day_count > MAX_MANUAL_SCHEDULE_DAYS:
+        raise ValueError(f"수동 날짜 범위는 최대 {MAX_MANUAL_SCHEDULE_DAYS}일까지 지정할 수 있습니다.")
+
+    return [start_date + timedelta(days=i) for i in range(day_count)]
 
 def format_day_label(date_obj: datetime):
     weekdays = ["월", "화", "수", "목", "금", "토", "일"]
@@ -468,7 +489,10 @@ def make_calendar_file(schedule_id: int):
 
     footer_height = 50
     calendar_top = top_area_height
-    summary_top = calendar_top + cell_height + 28
+    calendar_row_gap = 28
+    calendar_row_count = max(1, (len(week_dates) + 6) // 7)
+    calendar_height = cell_height * calendar_row_count + calendar_row_gap * (calendar_row_count - 1)
+    summary_top = calendar_top + calendar_height + 28
     height = summary_top + summary_box_height + footer_height
 
     # 색상
@@ -505,7 +529,7 @@ def make_calendar_file(schedule_id: int):
     # 상단 타이틀
     draw.text(
         (40, 24),
-        f"{schedule['title']} 주간 스케줄",
+        f"{schedule['title']} 스케줄",
         font=title_font,
         fill=title_color
     )
@@ -513,7 +537,7 @@ def make_calendar_file(schedule_id: int):
     draw.text(
         (40, 72),
         (
-            f"대상 주간: {schedule['week_start_label']} ~ {schedule['week_end_label']}"
+            f"대상 기간: {schedule['week_start_label']} ~ {schedule['week_end_label']}"
             f"   |   참여 인원: {get_participant_count(schedule_id)}명"
             f"   |   진행 가능 기준: {MIN_RAID_MEMBER_COUNT}명 이상"
         ),
@@ -525,11 +549,14 @@ def make_calendar_file(schedule_id: int):
     left_margin = 30
     right_margin = 30
     gap = 14
-    cell_width = (width - left_margin - right_margin - gap * 6) // 7
+    column_count = min(7, max(1, len(week_dates)))
+    cell_width = (width - left_margin - right_margin - gap * (column_count - 1)) // column_count
 
     for idx, date_obj in enumerate(week_dates):
-        x1 = left_margin + idx * (cell_width + gap)
-        y1 = calendar_top
+        column = idx % 7
+        row = idx // 7
+        x1 = left_margin + column * (cell_width + gap)
+        y1 = calendar_top + row * (cell_height + calendar_row_gap)
         x2 = x1 + cell_width
         y2 = y1 + cell_height
 
@@ -791,7 +818,7 @@ def build_schedule_embed(schedule_id: int):
         )
     else:
         description = (
-            "아래 버튼을 눌러 이번 주 참석 가능한 **날짜**를 고른 뒤,\n"
+            "아래 버튼을 눌러 해당 기간에 참석 가능한 **날짜**를 고른 뒤,\n"
             "**그 날 몇 시 이후 가능한지** 입력하세요.\n\n"
             "입력 예시: `21`, `21:30`, `오전 9시`, `오후 9시`, `오후 9시 30분`\n"
             "공란 제출: `아무때나 가능`\n"
@@ -807,7 +834,7 @@ def build_schedule_embed(schedule_id: int):
 
     embed.add_field(name="생성자", value=schedule["creator_name"], inline=True)
     embed.add_field(
-        name="대상 주간",
+        name="대상 기간",
         value=f"{schedule['week_start_label']} ~ {schedule['week_end_label']}",
         inline=True,
     )
@@ -1027,11 +1054,11 @@ class AvailableAfterModal(discord.ui.Modal):
             return
 
 class AllDaysButton(discord.ui.Button):
-    def __init__(self, schedule_id: int):
+    def __init__(self, schedule_id: int, row: int = 2):
         super().__init__(
             label="전부 가능",
             style=discord.ButtonStyle.success,
-            row=2,
+            row=row,
         )
         self.schedule_id = schedule_id
 
@@ -1071,11 +1098,11 @@ class DayButton(discord.ui.Button):
 
 
 class ResetMyScheduleButton(discord.ui.Button):
-    def __init__(self, schedule_id: int):
+    def __init__(self, schedule_id: int, row: int = 2):
         super().__init__(
             label="내 일정 전체 삭제",
             style=discord.ButtonStyle.danger,
-            row=2,
+            row=row,
         )
         self.schedule_id = schedule_id
 
@@ -1107,11 +1134,12 @@ class DaySelectView(discord.ui.View):
         for idx, (day_key, _) in enumerate(day_items):
             date_obj = datetime.strptime(day_key, "%Y-%m-%d")
             label = short_day_label(date_obj)
-            row = 0 if idx < 4 else 1
+            row = idx // 5
             self.add_item(DayButton(schedule_id, day_key, label, row=row))
 
-        self.add_item(AllDaysButton(schedule_id))
-        self.add_item(ResetMyScheduleButton(schedule_id))
+        action_row = (len(day_items) + 4) // 5
+        self.add_item(AllDaysButton(schedule_id, row=action_row))
+        self.add_item(ResetMyScheduleButton(schedule_id, row=action_row))
 
 class OpenWeekInputButton(discord.ui.Button):
     def __init__(self, schedule_id: int):
@@ -1483,42 +1511,31 @@ async def on_ready():
         print(f"Failed to initialize bot: {e}")
 
 
-@bot.tree.command(
-    name="스케줄생성",
-    description="레이드 주간 스케줄을 생성합니다.",
-)
-@app_commands.describe(
-    제목="예: 침식레이드, 하멘, 베히모스"
-)
-async def create_schedule(
+async def create_schedule_for_dates(
     interaction: discord.Interaction,
-    제목: str,
+    title: str,
+    schedule_dates,
+    period_value: str,
 ):
-    if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message(
-            "서버 안에서만 사용할 수 있는 명령어입니다.",
-            ephemeral=True,
-        )
-        return
+    week_start = schedule_dates[0]
+    week_end = schedule_dates[-1]
 
-    if not is_raid_leader(interaction.user):
-        await interaction.response.send_message(
-            "공대장만 스케줄을 생성할 수 있습니다.",
-            ephemeral=True,
-        )
-        return
+    # Discord 인터랙션은 3초 안에 응답해야 하므로 이미지 생성 전에 먼저 승인한다.
+    await interaction.response.defer(thinking=True)
 
-    week_dates = get_week_dates()
-    week_start = week_dates[0]
-    week_end = week_dates[-1]
+    print(
+        "Creating schedule: "
+        f"period={period_value}, "
+        f"range={week_start.strftime('%Y-%m-%d')}~{week_end.strftime('%Y-%m-%d')}"
+    )
 
     days = {}
-    for date_obj in week_dates:
+    for date_obj in schedule_dates:
         day_key = date_obj.strftime("%Y-%m-%d")
         days[day_key] = format_day_label(date_obj)
 
     temp_schedule = {
-        "title": 제목,
+        "title": title,
         "creator_id": interaction.user.id,
         "creator_name": interaction.user.display_name,
         "guild_id": interaction.guild_id,
@@ -1529,7 +1546,6 @@ async def create_schedule(
     }
 
     schedule_id = create_schedule_record(temp_schedule)
-
     deleted_schedule_ids = prune_old_schedules(MAX_STORED_SCHEDULE_COUNT)
 
     for deleted_schedule_id in deleted_schedule_ids:
@@ -1540,7 +1556,7 @@ async def create_schedule(
 
     schedules[schedule_id] = {
         "id": schedule_id,
-        "title": 제목,
+        "title": title,
         "creator_id": interaction.user.id,
         "creator_name": interaction.user.display_name,
         "guild_id": interaction.guild_id,
@@ -1548,7 +1564,7 @@ async def create_schedule(
         "message_id": None,
         "week_start": week_start.strftime("%Y-%m-%d"),
         "week_end": week_end.strftime("%Y-%m-%d"),
-        "week_dates": week_dates,
+        "week_dates": schedule_dates,
         "week_start_label": format_day_label(week_start),
         "week_end_label": format_day_label(week_end),
         "days": days,
@@ -1564,18 +1580,98 @@ async def create_schedule(
     calendar_file = make_calendar_file(schedule_id)
     view = ScheduleMainView(schedule_id)
 
-    await interaction.response.send_message(
+    message = await interaction.edit_original_response(
         embed=embed,
-        file=calendar_file,
+        attachments=[calendar_file],
         view=view,
     )
 
-    message = await interaction.original_response()
     schedules[schedule_id]["message_id"] = message.id
-
     update_schedule_message_id(schedule_id, message.id)
-
     bot.add_view(ScheduleMainView(schedule_id))
+
+
+@bot.tree.command(
+    name="스케줄생성",
+    description="수요일 기준으로 레이드 주간 스케줄을 생성합니다.",
+)
+@app_commands.describe(
+    제목="예: 침식레이드, 하멘, 베히모스",
+    기간="이번 주, 다음 주 또는 다다음 주를 선택합니다.",
+)
+@app_commands.choices(
+    기간=[
+        app_commands.Choice(name="이번 주", value="current"),
+        app_commands.Choice(name="다음 주", value="next"),
+        app_commands.Choice(name="다다음 주", value="week_after_next"),
+    ]
+)
+async def create_schedule(
+    interaction: discord.Interaction,
+    제목: str,
+    기간: app_commands.Choice[str] = None,
+):
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "서버 안에서만 사용할 수 있는 명령어입니다.",
+            ephemeral=True,
+        )
+        return
+
+    if not is_raid_leader(interaction.user):
+        await interaction.response.send_message(
+            "공대장만 스케줄을 생성할 수 있습니다.",
+            ephemeral=True,
+        )
+        return
+
+    period_value = 기간.value if 기간 else "current"
+    week_offset = {
+        "current": 0,
+        "next": 1,
+        "week_after_next": 2,
+    }[period_value]
+    week_dates = get_week_dates(datetime.now(KST) + timedelta(weeks=week_offset))
+
+    await create_schedule_for_dates(interaction, 제목, week_dates, period_value)
+
+
+@bot.tree.command(
+    name="스케줄수동생성",
+    description="시작일과 종료일을 직접 지정하여 스케줄을 생성합니다.",
+)
+@app_commands.describe(
+    제목="예: 침식레이드, 하멘, 베히모스",
+    시작일="시작일 (YYYY-MM-DD)",
+    종료일="종료일 (YYYY-MM-DD, 최대 14일)",
+)
+async def create_manual_schedule(
+    interaction: discord.Interaction,
+    제목: str,
+    시작일: str,
+    종료일: str,
+):
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "서버 안에서만 사용할 수 있는 명령어입니다.",
+            ephemeral=True,
+        )
+        return
+
+    if not is_raid_leader(interaction.user):
+        await interaction.response.send_message(
+            "공대장만 스케줄을 생성할 수 있습니다.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        schedule_dates = get_manual_dates(시작일, 종료일)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    await create_schedule_for_dates(interaction, 제목, schedule_dates, "manual")
 
 @bot.tree.command(
     name="스케줄목록",
