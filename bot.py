@@ -385,6 +385,33 @@ def build_missing_members_short_text(schedule_id: int):
     return f"{status['missing_count']}/{status['total_count']}명 미입력"
 
 
+def build_missing_members_list_text(schedule_id: int, max_display: int = 10):
+    status = get_participation_status(schedule_id)
+
+    if not status["available"]:
+        return "확인 불가"
+
+    total_count = status["total_count"]
+    missing_count = status["missing_count"]
+
+    if missing_count == 0:
+        return f"전원 입력 완료 ({status['participant_count']}/{total_count}명)"
+
+    visible_members = status["missing_members"][:max_display]
+    hidden_count = missing_count - len(visible_members)
+    names = [
+        discord.utils.escape_markdown(member.display_name)
+        for member in visible_members
+    ]
+
+    text = f"{missing_count}/{total_count}명 미입력: {', '.join(names)}"
+
+    if hidden_count > 0:
+        text += f" 외 {hidden_count}명"
+
+    return text
+
+
 def get_user_selected_time(schedule_id: int, user_id: int, day_key: str):
     schedule = schedules[schedule_id]
     user_data = schedule["availability"].get(str(user_id))
@@ -1820,7 +1847,7 @@ async def list_schedules(interaction: discord.Interaction):
             f"**Schedule ID:** `{schedule_id}`\n"
             f"**대상 주간:** {schedule['week_start_label']} ~ {schedule['week_end_label']}\n"
             f"**참여 인원:** {build_participant_count_text(schedule_id)}\n"
-            f"**미입력 인원:** {build_missing_members_short_text(schedule_id)}\n"
+            f"**미입력 인원:** {build_missing_members_list_text(schedule_id)}\n"
             f"**상태:** {'확정됨' if is_schedule_confirmed(schedule_id) else '입력 중'}\n"
             f"**{status_title}:**\n{schedule_status_summary}"
         )
