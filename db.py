@@ -263,6 +263,14 @@ def build_week_dates_from_start(week_start_text):
     return [week_start + timedelta(days=i) for i in range(7)]
 
 
+def build_dates_from_range(week_start_text, week_end_text):
+    week_start = datetime.strptime(week_start_text, "%Y-%m-%d")
+    week_end = datetime.strptime(week_end_text, "%Y-%m-%d")
+
+    day_count = (week_end - week_start).days + 1
+    return [week_start + timedelta(days=i) for i in range(day_count)]
+
+
 def load_active_schedules():
     conn = get_connection()
     cur = conn.cursor()
@@ -299,7 +307,7 @@ def load_active_schedules():
     for row in schedule_rows:
         schedule_id = row["id"]
 
-        week_dates = build_week_dates_from_start(row["week_start"])
+        week_dates = build_dates_from_range(row["week_start"], row["week_end"])
 
         days = {}
         for date_obj in week_dates:
@@ -327,6 +335,23 @@ def load_active_schedules():
             "confirmed_schedules": [],
         }
 
+    for row in availability_rows:
+        schedule_id = row["schedule_id"]
+
+        if schedule_id not in schedules:
+            continue
+
+        user_id = str(row["user_id"])
+
+        if user_id not in schedules[schedule_id]["availability"]:
+            schedules[schedule_id]["availability"][user_id] = {
+                "name": row["user_name"],
+                "selected": {},
+            }
+
+        schedules[schedule_id]["availability"][user_id]["name"] = row["user_name"]
+        schedules[schedule_id]["availability"][user_id]["selected"][row["day_key"]] = row["time_value"]
+
     for row in confirmed_rows:
         schedule_id = row["schedule_id"]
 
@@ -342,17 +367,6 @@ def load_active_schedules():
                 "created_at": row["created_at"],
             }
         )
-
-        user_id = str(row["user_id"])
-
-        if user_id not in schedules[schedule_id]["availability"]:
-            schedules[schedule_id]["availability"][user_id] = {
-                "name": row["user_name"],
-                "selected": {},
-            }
-
-        schedules[schedule_id]["availability"][user_id]["name"] = row["user_name"]
-        schedules[schedule_id]["availability"][user_id]["selected"][row["day_key"]] = row["time_value"]
 
     return schedules
 
